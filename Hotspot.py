@@ -59,14 +59,14 @@ SNAPSHOT_DIR = r"C:\Users\Lenovo\Desktop\insert"  # 1.csv..89.csv (UTF-8)
 # Grid and data info
 NX, NY, NZ = 75, 51, 103
 N_CASES = 89
-Y_SLICE = 1.53  # meters (用于切片可视化)
-Y_PLANE_FOR_RRMSE = 1.53  # 指定计算rRMSE的Y平面值
+Y_SLICE = 1.26  # meters (用于切片可视化)
+Y_PLANE_FOR_RRMSE = 1.26  # 指定计算rRMSE的Y平面值
 
 # --- 新增: 相对误差指标的阈值 ---
-RELATIVE_ERROR_THRESHOLD = 0.10  # 10%
+RELATIVE_ERROR_THRESHOLD = 0.10  # 15%
 
 # Energy thresholds (per-mode)
-ENERGY_THRESH = 0.9999
+ENERGY_THRESH = 0.99
 
 # Centering and scaling
 CENTER_ALONG_N = True
@@ -436,13 +436,12 @@ def main():
     print("=== 指标计算 (逐案例 & 平均) ===")
     mae_list, rmse_list, rRMSE_list = [], [], []
     rRMSE_plane_list = []
-    percentage_below_threshold_list = []  # <--- 新增: 创建一个列表来存储新指标
+    percentage_below_threshold_list = []
 
     for k in range(preds.shape[-1]):
         y_true = gts[..., k].ravel()
         y_hat = preds[..., k].ravel()
 
-        # 1. 全局误差计算 (3D)
         mae = mean_absolute_error(y_true, y_hat)
         rmse = math.sqrt(mean_squared_error(y_true, y_hat))
         norm_true = np.linalg.norm(y_true)
@@ -453,7 +452,6 @@ def main():
         rmse_list.append(rmse)
         rRMSE_list.append(rRMSE_case)
 
-        # 2. 特定平面误差计算 (2D)
         true_slice = gts[:, y_plane_rrmse_index, :, k]
         pred_slice = preds[:, y_plane_rrmse_index, :, k]
         y_true_plane = true_slice.ravel()
@@ -463,29 +461,23 @@ def main():
         rRMSE_case_plane = norm_err_plane / (norm_true_plane + 1e-9)
         rRMSE_plane_list.append(rRMSE_case_plane)
 
-        # 3. <--- 新增: 计算相对误差小于阈值的点的百分比 --->
         relative_error = np.abs(y_true - y_hat) / (np.abs(y_true) + 1e-9)
         num_points_below = np.sum(relative_error < RELATIVE_ERROR_THRESHOLD)
         percentage = (num_points_below / len(y_true)) * 100
         percentage_below_threshold_list.append(percentage)
-        # <--- 新增结束 --->
 
-        # <--- 修改: 更新打印信息以包含所有指标 --->
         print(
             f"  案例 {idx_test[k] + 1:2d}: MAE={mae:.4f}, RMSE={rmse:.4f}, rRMSE={rRMSE_case:.4f}, "
             f"rRMSE_plane(Y={y_plane_rrmse_value:.2f})={rRMSE_case_plane:.4f}, "
             f"点占比(<{int(RELATIVE_ERROR_THRESHOLD * 100)}%)={percentage:.2f}%"
         )
 
-    # <--- 修改: 更新平均值打印信息 --->
     print(
         f"\n[全场 3D 平均] MAE={np.mean(mae_list):.4f} °C, RMSE={np.mean(rmse_list):.4f} °C, rRMSE={np.mean(rRMSE_list):.4f}")
     print(f"[平面 Y={y_plane_rrmse_value:.2f}m 平均] rRMSE={np.mean(rRMSE_plane_list):.4f}")
-    # <--- 新增: 打印新指标的平均值 --->
     print(
         f"[全场 3D 平均] 点占比(<{int(RELATIVE_ERROR_THRESHOLD * 100)}%)={np.mean(percentage_below_threshold_list):.2f}%")
 
-    # --- rRMSE_n 部分代码不变 ---
     print("\n=== 计算热点前10的rRMSE_n ===")
     if T_mean_train is not None:
         mean_temp_field = T_mean_train.squeeze()
@@ -510,8 +502,67 @@ def main():
         rRMSE_n_results[int(flat_idx)] = float(rRMSE_n_value)
         print(f"  网格点索引 {flat_idx:<7} (平均 T ≈ {avg_temp_at_point:.1f}°C): rRMSE_n = {rRMSE_n_value:.4f}")
 
+    # =================================================================================
+    # 【新功能】汇总指定热点的温度与误差数据 (NEW FEATURE: Summarize Data for Specific Hot Spots)
+    # =================================================================================
+    print("\n=== 为指定的10个热点汇总温度数据 ===")
+
+    # --- 使用您在之前请求中提供的固定索引列表 ---
+    pre_selected_indices = [
+        113159, 118413, 118310, 113158, 118516,
+        113056, 118207, 113262, 113055, 112953
+    ]
+
+    # 准备一个列表，用于存储每个热点的数据
+    hot_spot_data_list = []
+
+    # 遍历指定的10个点的索引
+    for flat_idx in pre_selected_indices:
+        # 安全检查，防止索引越界
+        if flat_idx >= (NX * NY * NZ):
+            print(f"警告：网格点索引 {flat_idx} 超出范围，已跳过。")
+            continue
+
+        # 将一维平铺索引转换为三维网格坐标 (i, j, k)
+        i, j, k_dim = np.unravel_index(flat_idx, (NX, NY, NZ))
+
+        # 为当前点创建一个字典，用于存储其所有信息
+        point_data = {
+            'Point_Index': flat_idx,
+            'X (m)': xs[i],
+            'Y (m)': ys[j],
+            'Z (m)': zs[k_dim]
+        }
+
+        # 从 gts 和 preds 矩阵中抽取出这个点在所有验证案例中的温度序列
+        # gts/preds 形状是 (NX, NY, NZ, num_test_cases)
+        true_series = gts[i, j, k_dim, :]
+        pred_series = preds[i, j, k_dim, :]
+        error_series = np.abs(true_series - pred_series)
+
+        # 将每个验证案例的真实值、预测值和误差值添加到字典中
+        # idx_test 存储的是原始数据集中的索引 (e.g., [0, 1, 2, ...])
+        for c_idx, original_case_idx in enumerate(idx_test):
+            case_num = original_case_idx + 1
+            point_data[f'Case_{case_num}_True_T'] = true_series[c_idx]
+            point_data[f'Case_{case_num}_Pred_T'] = pred_series[c_idx]
+            point_data[f'Case_{case_num}_AbsError_T'] = error_series[c_idx]
+
+        # 将该点的数据字典添加到列表中
+        hot_spot_data_list.append(point_data)
+
+    # 使用列表中的字典创建Pandas DataFrame
+    if hot_spot_data_list:
+        df_hot_spots = pd.DataFrame(hot_spot_data_list)
+        # 保存到新的、专门的CSV文件中
+        summary_file_path = os.path.join(FIG_DIR, "hot_spots_temperature_summary_tucker.csv")
+        df_hot_spots.to_csv(summary_file_path, index=False, float_format='%.4f')
+        print(f"10个热点的详细温度及误差数据已保存至: {summary_file_path}")
+    else:
+        print("没有有效的热点索引可供汇总。")
+
+
     # =================== 保存指标和绘图 ===================
-    # <--- 修改: 将新指标添加到DataFrame中 --->
     df = pd.DataFrame({
         "Case": [int(i) + 1 for i in idx_test],
         "MAE": [float(x) for x in mae_list],
@@ -524,7 +575,6 @@ def main():
     df = df.sort_values("Case")
     df.to_csv(os.path.join(FIG_DIR, "per_case_metrics.csv"), index=False, float_format='%.6f')
 
-    # <--- 绘图代码保持不变，因为新指标是百分比，与原有误差指标量纲不同，不适合画在同一张图上 --->
     plt.figure(figsize=(12, 6))
     plt.plot(df["Case"], df["MAE"], '-o', label="MAE (°C) [Full 3D]")
     plt.plot(df["Case"], df["RMSE"], '-s', label="RMSE (°C) [Full 3D]")
@@ -599,7 +649,6 @@ def main():
         k = min(50, len(S))
         return cum[:k].tolist()
 
-    # <--- 修改: 将新指标添加到JSON摘要中 --->
     summary = {
         "model_type": "Tucker_HOSVD",
         "decomposition_set": "TRAIN",
@@ -622,7 +671,7 @@ def main():
                 "y_value": float(y_plane_rrmse_value),
                 "value": float(np.mean(rRMSE_plane_list))
             },
-            "points_percentage_below_threshold": {  # <--- 新增
+            "points_percentage_below_threshold": {
                 "threshold": float(RELATIVE_ERROR_THRESHOLD),
                 "mean_percentage": float(np.mean(percentage_below_threshold_list)),
                 "each_case_percentage": [float(x) for x in percentage_below_threshold_list]

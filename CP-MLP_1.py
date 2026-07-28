@@ -1,33 +1,15 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-Tucker (TRAIN-only) with Per-Mode Energy-Based Rank Selection + MLP
--------------------------------------------------------------------
-- Tucker 分解仅在【训练集】上完成（避免信息泄漏）
-- 每个模式 (X/Y/Z/N) 的秩由【该模展开矩阵的能量阈值】自动选取
-- 统一子空间 (Ux,Uy,Uz,G) 对全体样本投影得到系数；仅用训练集系数训练回归器
-- 增加了 rRMSE 和 rRMSE_n 指标计算
-- 能量加权损失（可选）、标准化（仅 fit 在训练集）
-- 统一误差色标（若提供 POD 的 global_error_max.npy）
-- 保存逐工况 MAE/RMSE/rRMSE、折线图、切片云图与 metrics_summary.json
-
-Author: (your name)
-Date: 2025-10-21
-"""
-
 import os
 import sys
 import math
 import json
 import time
 import warnings
-from typing import Tuple, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sklearn.utils.extmath import randomized_svd
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -50,6 +32,15 @@ try:
 except Exception:
     SCIPY_OK = False
 
+# ============== CP（PARAFAC）相关依赖 ==============
+try:
+    import tensorly as tl
+    from tensorly.decomposition import parafac
+
+    TL_OK = True
+except Exception:
+    TL_OK = False
+
 # ========================== User Config ==========================
 
 # Paths
@@ -59,19 +50,18 @@ SNAPSHOT_DIR = r"C:\Users\Lenovo\Desktop\insert"  # 1.csv..89.csv (UTF-8)
 # Grid and data info
 NX, NY, NZ = 75, 51, 103
 N_CASES = 89
-Y_SLICE = 1.53  # meters (用于切片可视化)
-Y_PLANE_FOR_RRMSE = 1.53  # 指定计算rRMSE的Y平面值
-
-# --- 新增: 相对误差指标的阈值 ---
-RELATIVE_ERROR_THRESHOLD = 0.10  # 10%
-
-# Energy thresholds (per-mode)
-ENERGY_THRESH = 0.9999
+Y_SLICE = 2.52  # meters (用于切片可视化)
+Y_PLANE_FOR_RRMSE = 2.52  # <--- 新增: 指定计算rRMSE的Y平面值
 
 # Centering and scaling
 CENTER_ALONG_N = True
 SCALE_INPUTS = True
 SCALE_OUTPUT_COEFF = True
+
+# CP 分解设置
+CP_RANK = 16
+CP_N_ITER_MAX = 2000
+CP_TOL = 1e-7
 
 # Regressor choice
 REGRESSOR = "MLP_TORCH"
@@ -85,7 +75,7 @@ WEIGHT_DECAY = 1e-4
 EPOCHS = 2000
 BATCH_SIZE = 16
 
-# Energy-weighted loss
+# 能量加权
 USE_ENERGY_WEIGHTS = True
 
 # PCA bottleneck
@@ -110,10 +100,10 @@ UPSAMPLE_FZ = 1
 SAVE_ERROR_MAP = True
 
 # Output directory
-FIG_DIR = r"C:\Users\Lenovo\Desktop\TensorPOD89\figures_improved"
+FIG_DIR = r"C:\Users\Lenovo\Desktop\TensorPOD89\figures_improved_CP1"
 os.makedirs(FIG_DIR, exist_ok=True)
 
-# Unified error colormap
+# 与 POD 统一误差色标
 POD_ERROR_MAX_PATH = r"C:\Users\Lenovo\Desktop\POD89_Fixed_Test_Set-1\global_error_max.npy"
 
 
@@ -156,18 +146,6 @@ def df_to_grid_values(df, xs, ys, zs):
     return grid
 
 
-def mode_n_unfold(T: np.ndarray, mode: int) -> np.ndarray:
-    return np.moveaxis(T, mode, 0).reshape(T.shape[mode], -1)
-
-
-def n_mode_product(T: np.ndarray, U: np.ndarray, mode: int) -> np.ndarray:
-    T_perm = np.moveaxis(T, mode, 0)
-    out = U @ T_perm.reshape(T_perm.shape[0], -1)
-    new_shape = (U.shape[0],) + T_perm.shape[1:]
-    out = out.reshape(new_shape)
-    return np.moveaxis(out, 0, mode)
-
-
 def upsample_if_needed(xs, zs, Txz):
     if (UPSAMPLE_FX <= 1 and UPSAMPLE_FZ <= 1) or not SCIPY_OK:
         return xs, zs, Txz
@@ -178,43 +156,7 @@ def upsample_if_needed(xs, zs, Txz):
     return xi, zi, Txz_hi
 
 
-# ========================== Per-mode energy-based HOSVD (代码未改变) ==========================
-def select_rank_by_energy_unfold(X: np.ndarray, thr: float, max_rank: Optional[int] = None):
-    I = X.shape[0]
-    n_comp = I if max_rank is None else min(I, max_rank)
-    U, S, VT = randomized_svd(X, n_components=n_comp, random_state=RANDOM_STATE)
-    eng = (S ** 2)
-    cum = np.cumsum(eng) / np.sum(eng)
-    r = int(np.searchsorted(cum, thr) + 1)
-    r = max(1, min(r, n_comp))
-    return U[:, :r], r, S
-
-
-def hosvd_per_mode_energy_train_only(T_centered: np.ndarray, idx_train: np.ndarray, thr: float):
-    T_train = T_centered[..., idx_train]
-    Ux, rx, Sx = select_rank_by_energy_unfold(mode_n_unfold(T_train, 0), thr)
-    Uy, ry, Sy = select_rank_by_energy_unfold(mode_n_unfold(T_train, 1), thr)
-    Uz, rz, Sz = select_rank_by_energy_unfold(mode_n_unfold(T_train, 2), thr)
-    Un, rn, Sn = select_rank_by_energy_unfold(mode_n_unfold(T_train, 3), thr)
-    ranks = (rx, ry, rz, rn)
-    G = T_train.copy()
-    G = n_mode_product(G, Ux.T, 0)
-    G = n_mode_product(G, Uy.T, 1)
-    G = n_mode_product(G, Uz.T, 2)
-    G = n_mode_product(G, Un.T, 3)
-    return (G, [Ux, Uy, Uz, Un], ranks, {"Sx": Sx, "Sy": Sy, "Sz": Sz, "Sn": Sn})
-
-
-def project_case_to_coeff(T_case: np.ndarray, Ux: np.ndarray, Uy: np.ndarray, Uz: np.ndarray,
-                          G: np.ndarray) -> np.ndarray:
-    B = n_mode_product(n_mode_product(n_mode_product(T_case.copy(), Ux.T, 0), Uy.T, 1), Uz.T, 2)
-    b = B.reshape(-1)
-    A = G.reshape(-1, G.shape[-1])
-    c, *_ = np.linalg.lstsq(A, b, rcond=None)
-    return c
-
-
-# ========================== Regressors (代码未改变) ==========================
+# ========================== MLP & 回归器 (代码未改变) ==========================
 class MLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_layers, use_layernorm=USE_LAYERNORM, dropout=DROPOUT):
         super().__init__()
@@ -225,7 +167,7 @@ class MLP(nn.Module):
             layers += [nn.ReLU(), nn.Dropout(dropout)]
             return nn.Sequential(*layers)
 
-        layers = []
+        layers = [];
         prev = in_dim
         for h in hidden_layers:
             layers.append(block(prev, h));
@@ -256,24 +198,27 @@ def fit_mlp_torch(X_train: np.ndarray, Y_train: np.ndarray, weight_per_dim: Opti
     if weight_per_dim is None:
         weight = torch.ones(Y_train.shape[1], dtype=torch.float32, device=device)
     else:
-        weight = torch.tensor(weight_per_dim, dtype=torch.float32, device=device)
+        w = weight_per_dim.astype(np.float32);
+        w = w / (np.mean(w) + 1e-12)
+        weight = torch.tensor(w, dtype=torch.float32, device=device)
     model.train()
     for ep in range(epochs):
         for xb, yb in loader:
             xb = xb.to(device);
             yb = yb.to(device)
-            opt.zero_grad()
+            opt.zero_grad();
             pred = model(xb)
-            diff = pred - yb
+            diff = pred - yb;
             loss = torch.mean(torch.sum((diff ** 2) * (weight ** 2), dim=1))
             loss.backward();
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0);
             opt.step()
         if (ep + 1) % 500 == 0: print(f"[MLP] Epoch {ep + 1}/{epochs} | Loss={loss.item():.6f}")
     return model
 
 
 def predict_mlp_torch(model: nn.Module, X: np.ndarray) -> np.ndarray:
-    device = next(model.parameters()).device
+    device = next(model.parameters()).device;
     model.eval()
     with torch.no_grad():
         X_t = torch.tensor(X, dtype=torch.float32, device=device)
@@ -301,159 +246,171 @@ def choose_regressor(name: str, y_dim: int):
     return model
 
 
-# ========================== Main ==========================
+# ========================== CP（PARAFAC）核心实现 (代码未改变) ==========================
+def cp_fit_train_only(T_centered: np.ndarray, idx_train: np.ndarray, R: int, n_iter_max: int = 2000, tol: float = 1e-7,
+                      random_state: int = 42):
+    if not TL_OK: raise RuntimeError("需要安装 tensorly： pip install tensorly")
+    tl.set_backend('numpy')
+    T_train = T_centered[..., idx_train]
+    cp = parafac(T_train, rank=R, init='svd', tol=tol, n_iter_max=n_iter_max, random_state=random_state,
+                 normalize_factors=True)
+    lambdas = cp.weights;
+    Ax, Ay, Az, An_train = cp.factors
+    return lambdas, Ax, Ay, Az, An_train
 
+
+def cp_build_projection_matrix(Ax: np.ndarray, Ay: np.ndarray, Az: np.ndarray, lambdas: np.ndarray) -> np.ndarray:
+    NX, R = Ax.shape;
+    NY = Ay.shape[0];
+    NZ = Az.shape[0]
+    M = np.empty((NX * NY * NZ, R), dtype=np.float64)
+    for r in range(R):
+        outer3 = np.multiply.outer(np.multiply.outer(Ax[:, r], Ay[:, r]), Az[:, r])
+        M[:, r] = float(lambdas[r]) * outer3.reshape(-1)
+    return M
+
+
+def project_case_to_cp_coeff(T_case: np.ndarray, M: np.ndarray) -> np.ndarray:
+    b = T_case.reshape(-1);
+    d, *_ = np.linalg.lstsq(M, b, rcond=None)
+    return d
+
+
+def cp_reconstruct_from_d(d: np.ndarray, Ax, Ay, Az, lambdas, T_mean_train=None):
+    NX, R = Ax.shape;
+    NY = Ay.shape[0];
+    NZ = Az.shape[0]
+    T_rec = np.zeros((NX, NY, NZ), dtype=np.float64)
+    for r in range(R):
+        T_rec += (lambdas[r] * d[r]) * np.multiply.outer(np.multiply.outer(Ax[:, r], Ay[:, r]), Az[:, r])
+    if T_mean_train is not None:
+        T_rec = T_rec + T_mean_train[..., 0]
+    return T_rec
+
+
+def cp_component_energy_weights(lambdas, Ax, Ay, Az):
+    R = Ax.shape[1];
+    w = np.zeros(R, dtype=np.float64)
+    for r in range(R):
+        w[r] = abs(float(lambdas[r])) * np.linalg.norm(Ax[:, r]) * np.linalg.norm(Ay[:, r]) * np.linalg.norm(Az[:, r])
+    w = w / (np.max(w) + 1e-12);
+    w = np.clip(w, 1e-3, None)
+    return w
+
+
+# ========================== Main ==========================
 def main():
     np.random.seed(RANDOM_STATE)
     start_main_time = time.time()
 
-    print("=== 加载参数 ===")
+    if not TL_OK:
+        raise RuntimeError("未检测到 tensorly，请先安装： pip install tensorly")
+
+    print("=== Load parameters ===")
     params_df = read_params_csv(PARAMS_PATH)
     X_params = params_df.to_numpy(dtype=np.float64)
 
-    print("=== 读取首个快照，构建网格 ===")
+    print("=== Read first snapshot, build grid ===")
     df0 = read_one_snapshot_csv(os.path.join(SNAPSHOT_DIR, "1.csv"))
     xs, ys, zs = build_grid_from_df(df0)
 
-    # --- 平面索引定位 ---
+    # --- 平面索引定位 --- <--- 修改
     y_slice_index = int(np.argmin(np.abs(ys - Y_SLICE)))
-    print(f"用于可视化的Y切片 ≈ {Y_SLICE} m -> index {y_slice_index}, y={ys[y_slice_index]:.4f}")
+    print(f"Y slice for visualization ≈ {Y_SLICE} m -> index {y_slice_index}, y={ys[y_slice_index]:.4f}")
 
     y_plane_rrmse_index = int(np.argmin(np.abs(ys - Y_PLANE_FOR_RRMSE)))
     y_plane_rrmse_value = ys[y_plane_rrmse_index]
     print(
-        f"用于计算rRMSE的Y平面 ≈ {Y_PLANE_FOR_RRMSE} m -> index {y_plane_rrmse_index}, y={y_plane_rrmse_value:.4f}")
+        f"Y plane for rRMSE calculation ≈ {Y_PLANE_FOR_RRMSE} m -> index {y_plane_rrmse_index}, y={y_plane_rrmse_value:.4f}")
+    # --- 修改结束 ---
 
-    print("=== 构建张量 T ===")
+    print("=== Build tensor T ===")
     T = np.empty((NX, NY, NZ, N_CASES), dtype=np.float64)
     T[..., 0] = df_to_grid_values(df0, xs, ys, zs)
     for i in range(2, N_CASES + 1):
         p = os.path.join(SNAPSHOT_DIR, f"{i}.csv")
         dfi = read_one_snapshot_csv(p)
         T[..., i - 1] = df_to_grid_values(dfi, xs, ys, zs)
-        if i % 20 == 0 or i == N_CASES:
-            print(f"  已加载 {i}/{N_CASES}")
+        if i % 20 == 0 or i == N_CASES: print(f"  Loaded {i}/{N_CASES}")
 
-    print("=== 训练/测试集划分 (固定索引) ===")
-    TEST_IDX_ONE_BASED = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # --- 后续代码直到 Metrics 计算部分保持不变 ---
+    print("=== Train/Test split (fixed indices) ===")
+    TEST_IDX_ONE_BASED = [8, 9, 20, 21, 58, 68, 72, 76, 84]
     idx_test = np.array([i - 1 for i in TEST_IDX_ONE_BASED], dtype=int)
     idx_all = np.arange(N_CASES)
     idx_train = np.setdiff1d(idx_all, idx_test, assume_unique=False)
-    print(f"  训练集大小 = {len(idx_train)}, 测试集大小 = {len(idx_test)}")
     if CENTER_ALONG_N:
         T_mean_train = T[..., idx_train].mean(axis=3, keepdims=True)
         T_centered = T - T_mean_train
+        print("Applied N-mode mean centering using TRAIN set mean.")
     else:
-        T_mean_train = None
-        T_centered = T
-    print(f"=== Tucker 分解 (仅训练集) 能量阈值 = {ENERGY_THRESH} ===")
-    (G_train, [Ux, Uy, Uz, Un_train], ranks, singvals) = hosvd_per_mode_energy_train_only(T_centered, idx_train,
-                                                                                          ENERGY_THRESH)
-    rx, ry, rz, rn = ranks
-    print(f"选择的秩: rx={rx}, ry={ry}, rz={rz}, rn={rn}")
-    print("=== 通过投影构建所有案例的系数 ===")
-    Y_coeff_all = np.zeros((N_CASES, rn), dtype=np.float64)
-    for n in range(N_CASES):
-        Y_coeff_all[n, :] = project_case_to_coeff(T_centered[..., n], Ux, Uy, Uz, G_train)
+        T_mean_train = None; T_centered = T
+    print(f"=== CP (TRAIN-only) rank = {CP_RANK} ===")
+    t0 = time.time()
+    lambdas, Ax, Ay, Az, An_train = cp_fit_train_only(T_centered, idx_train, CP_RANK, n_iter_max=CP_N_ITER_MAX,
+                                                      tol=CP_TOL, random_state=RANDOM_STATE)
+    print(f"CP fit time: {time.time() - t0:.2f}s")
+    print("=== Build CP coefficients for ALL cases via projection ===")
+    M_cp = cp_build_projection_matrix(Ax, Ay, Az, lambdas);
+    R = Ax.shape[1]
+    Y_coeff_all = np.zeros((N_CASES, R), dtype=np.float64)
+    for n in range(N_CASES): Y_coeff_all[n, :] = project_case_to_cp_coeff(T_centered[..., n], M_cp)
     X_train_raw, X_test_raw = X_params[idx_train], X_params[idx_test]
     Y_train_raw, Y_test_raw = Y_coeff_all[idx_train], Y_coeff_all[idx_test]
-    if USE_ENERGY_WEIGHTS and not USE_PCA_BOTTLENECK:
-        Gn = np.linalg.norm(G_train.reshape(-1, G_train.shape[-1]), axis=0)
-        w = np.clip(Gn / (Gn.max() + 1e-12), 1e-3, None)
+    if USE_ENERGY_WEIGHTS:
+        w = cp_component_energy_weights(lambdas, Ax, Ay, Az)
     else:
         w = None
     if USE_PCA_BOTTLENECK:
-        pca = PCA(n_components=PCA_LATENT_Q, random_state=RANDOM_STATE)
-        Z_train = pca.fit_transform(Y_train_raw);
-        Z_test = pca.transform(Y_test_raw)
-        if SCALE_INPUTS:
-            x_scaler = StandardScaler().fit(X_train_raw);
-            X_train = x_scaler.transform(
-                X_train_raw);
-            X_test = x_scaler.transform(X_test_raw)
-        else:
-            X_train, X_test = X_train_raw, X_test_raw
-        if SCALE_OUTPUT_COEFF:
-            z_scaler = StandardScaler().fit(Z_train);
-            Z_train_s = z_scaler.transform(Z_train)
-        else:
-            z_scaler = None;
-            Z_train_s = Z_train
-        print(f"=== 训练回归器: {REGRESSOR} (在PCA分数上) ===")
-        t0 = time.time()
-        if REGRESSOR.upper() == "MLP_TORCH":
-            model = fit_mlp_torch(X_train, Z_train_s);
-            Z_pred_s = predict_mlp_torch(model, X_test)
-        else:
-            base = choose_regressor(REGRESSOR, PCA_LATENT_Q);
-            base.fit(X_train, Z_train_s);
-            Z_pred_s = base.predict(
-                X_test)
-        print(f"回归器训练时间: {time.time() - t0:.2f}s")
-        Z_pred = z_scaler.inverse_transform(Z_pred_s) if SCALE_OUTPUT_COEFF else Z_pred_s
-        Y_pred = pca.inverse_transform(Z_pred)
+        raise NotImplementedError("PCA Bottleneck logic is omitted for clarity.")
     else:
         if SCALE_INPUTS:
-            x_scaler = StandardScaler().fit(X_train_raw);
-            X_train = x_scaler.transform(
-                X_train_raw);
-            X_test = x_scaler.transform(X_test_raw)
+            x_scaler = StandardScaler().fit(X_train_raw); X_train = x_scaler.transform(
+                X_train_raw); X_test = x_scaler.transform(X_test_raw)
         else:
             X_train, X_test = X_train_raw, X_test_raw
         if SCALE_OUTPUT_COEFF:
-            y_scaler = StandardScaler().fit(Y_train_raw);
-            Y_train = y_scaler.transform(Y_train_raw)
+            y_scaler = StandardScaler().fit(Y_train_raw); Y_train = y_scaler.transform(Y_train_raw)
         else:
-            y_scaler = None;
-            Y_train = Y_train_raw
-        print(f"=== 训练回归器: {REGRESSOR} (能量加权={USE_ENERGY_WEIGHTS}) ===")
+            y_scaler = None; Y_train = Y_train_raw
+        print(f"=== Fit regressor: {REGRESSOR} (energy-weighted={USE_ENERGY_WEIGHTS}) ===")
         t0 = time.time()
         if REGRESSOR.upper() == "MLP_TORCH":
-            model = fit_mlp_torch(X_train, Y_train, weight_per_dim=w);
-            Y_pred_s = predict_mlp_torch(model, X_test)
+            model = fit_mlp_torch(X_train, Y_train, weight_per_dim=w); Y_pred_s = predict_mlp_torch(model, X_test)
         else:
-            base = choose_regressor(REGRESSOR, Y_train.shape[1]);
-            base.fit(X_train, Y_train);
-            Y_pred_s = base.predict(
+            base = choose_regressor(REGRESSOR, Y_train.shape[1]); base.fit(X_train, Y_train); Y_pred_s = base.predict(
                 X_test)
-        print(f"回归器训练时间: {time.time() - t0:.2f}s")
+        print(f"Regressor fit time: {time.time() - t0:.2f}s")
         Y_pred = y_scaler.inverse_transform(Y_pred_s) if SCALE_OUTPUT_COEFF else Y_pred_s
-    print("=== 重构测试集的3D温度场 ===")
+    print("=== Reconstruct test 3D fields (CP) ===")
     preds, gts = [], []
     for j, case_idx in enumerate(idx_test):
-        coeff = Y_pred[j]
-        M = np.tensordot(G_train, coeff, axes=([3], [0]))
-        T1 = n_mode_product(M, Ux, 0)
-        T2 = n_mode_product(T1, Uy, 1)
-        T3 = n_mode_product(T2, Uz, 2)
-        T_pred = T3 + (T_mean_train[..., 0] if CENTER_ALONG_N else 0.0)
-        preds.append(T_pred)
+        preds.append(cp_reconstruct_from_d(Y_pred[j], Ax, Ay, Az, lambdas, T_mean_train))
         gts.append(T[..., case_idx])
-    preds = np.stack(preds, axis=-1)
+    preds = np.stack(preds, axis=-1);
     gts = np.stack(gts, axis=-1)
 
-    # =================== 指标计算 (MAE, RMSE, rRMSE, etc.) ===================
-    print("=== 指标计算 (逐案例 & 平均) ===")
+    # =================== Metrics (MAE, RMSE, rRMSE, rRMSE_n) ===================
+    print("=== Metrics (per-case & mean) ===")
     mae_list, rmse_list, rRMSE_list = [], [], []
-    rRMSE_plane_list = []
-    percentage_below_threshold_list = []  # <--- 新增: 创建一个列表来存储新指标
+    rRMSE_plane_list = []  # <--- 新增: 用于存储平面rRMSE
 
     for k in range(preds.shape[-1]):
+        # 1. 全局误差计算 (3D)
         y_true = gts[..., k].ravel()
         y_hat = preds[..., k].ravel()
 
-        # 1. 全局误差计算 (3D)
         mae = mean_absolute_error(y_true, y_hat)
         rmse = math.sqrt(mean_squared_error(y_true, y_hat))
         norm_true = np.linalg.norm(y_true)
         norm_err = np.linalg.norm(y_true - y_hat)
         rRMSE_case = norm_err / (norm_true + 1e-9)
 
-        mae_list.append(mae)
-        rmse_list.append(rmse)
+        mae_list.append(mae);
+        rmse_list.append(rmse);
         rRMSE_list.append(rRMSE_case)
 
-        # 2. 特定平面误差计算 (2D)
+        # 2. 特定平面误差计算 (2D) <--- 新增
         true_slice = gts[:, y_plane_rrmse_index, :, k]
         pred_slice = preds[:, y_plane_rrmse_index, :, k]
         y_true_plane = true_slice.ravel()
@@ -462,38 +419,26 @@ def main():
         norm_err_plane = np.linalg.norm(y_true_plane - y_hat_plane)
         rRMSE_case_plane = norm_err_plane / (norm_true_plane + 1e-9)
         rRMSE_plane_list.append(rRMSE_case_plane)
+        # --- 新增结束 ---
 
-        # 3. <--- 新增: 计算相对误差小于阈值的点的百分比 --->
-        relative_error = np.abs(y_true - y_hat) / (np.abs(y_true) + 1e-9)
-        num_points_below = np.sum(relative_error < RELATIVE_ERROR_THRESHOLD)
-        percentage = (num_points_below / len(y_true)) * 100
-        percentage_below_threshold_list.append(percentage)
-        # <--- 新增结束 --->
-
-        # <--- 修改: 更新打印信息以包含所有指标 --->
+        # <--- 修改: 更新打印信息
         print(
-            f"  案例 {idx_test[k] + 1:2d}: MAE={mae:.4f}, RMSE={rmse:.4f}, rRMSE={rRMSE_case:.4f}, "
-            f"rRMSE_plane(Y={y_plane_rrmse_value:.2f})={rRMSE_case_plane:.4f}, "
-            f"点占比(<{int(RELATIVE_ERROR_THRESHOLD * 100)}%)={percentage:.2f}%"
-        )
+            f"  Case {idx_test[k] + 1:2d}: MAE={mae:.4f}, RMSE={rmse:.4f}, rRMSE={rRMSE_case:.4f}, rRMSE_plane(Y={y_plane_rrmse_value:.2f})={rRMSE_case_plane:.4f}")
 
-    # <--- 修改: 更新平均值打印信息 --->
+    # <--- 修改: 更新平均值打印信息
     print(
-        f"\n[全场 3D 平均] MAE={np.mean(mae_list):.4f} °C, RMSE={np.mean(rmse_list):.4f} °C, rRMSE={np.mean(rRMSE_list):.4f}")
-    print(f"[平面 Y={y_plane_rrmse_value:.2f}m 平均] rRMSE={np.mean(rRMSE_plane_list):.4f}")
-    # <--- 新增: 打印新指标的平均值 --->
-    print(
-        f"[全场 3D 平均] 点占比(<{int(RELATIVE_ERROR_THRESHOLD * 100)}%)={np.mean(percentage_below_threshold_list):.2f}%")
+        f"\n[Full 3D Mean] MAE={np.mean(mae_list):.4f}, RMSE={np.mean(rmse_list):.4f}, rRMSE={np.mean(rRMSE_list):.4f}")
+    print(f"[Plane Y={y_plane_rrmse_value:.2f}m Mean] rRMSE={np.mean(rRMSE_plane_list):.4f}")
 
     # --- rRMSE_n 部分代码不变 ---
-    print("\n=== 计算热点前10的rRMSE_n ===")
+    print("\n=== Calculating rRMSE_n for top 10 hottest unique points ===")
     if T_mean_train is not None:
         mean_temp_field = T_mean_train.squeeze()
     else:
         mean_temp_field = T[..., idx_train].mean(axis=3)
-    mean_temp_flat = mean_temp_field.ravel()
+    mean_temp_flat = mean_temp_field.ravel();
     unique_temps_sorted = np.unique(mean_temp_flat)
-    num_points_to_select = min(10, len(unique_temps_sorted))
+    num_points_to_select = min(10, len(unique_temps_sorted));
     top_10_unique_temps = unique_temps_sorted[-num_points_to_select:]
     top_10_indices = []
     for temp_val in reversed(top_10_unique_temps):
@@ -508,103 +453,86 @@ def main():
         rRMSE_n_value = np.linalg.norm(true_series - pred_series) / (norm_true_series + 1e-9)
         avg_temp_at_point = mean_temp_field[i, j, k_dim]
         rRMSE_n_results[int(flat_idx)] = float(rRMSE_n_value)
-        print(f"  网格点索引 {flat_idx:<7} (平均 T ≈ {avg_temp_at_point:.1f}°C): rRMSE_n = {rRMSE_n_value:.4f}")
+        print(f"  Grid Point Index {flat_idx:<7} (Avg T ≈ {avg_temp_at_point:.1f}°C): rRMSE_n = {rRMSE_n_value:.4f}")
 
-    # =================== 保存指标和绘图 ===================
-    # <--- 修改: 将新指标添加到DataFrame中 --->
+    # =================== Save Metrics and Plots ===================
+    # <--- 修改: 将新指标添加到DataFrame中
     df = pd.DataFrame({
         "Case": [int(i) + 1 for i in idx_test],
         "MAE": [float(x) for x in mae_list],
         "RMSE": [float(x) for x in rmse_list],
         "rRMSE": [float(x) for x in rRMSE_list],
-        f"rRMSE_plane_Y={y_plane_rrmse_value:.2f}m": [float(x) for x in rRMSE_plane_list],
-        f"Points_Percentage_RelErr_<{int(RELATIVE_ERROR_THRESHOLD * 100)}%": [float(x) for x in
-                                                                              percentage_below_threshold_list]
+        f"rRMSE_plane_Y={y_plane_rrmse_value:.2f}m": [float(x) for x in rRMSE_plane_list]
     })
     df = df.sort_values("Case")
-    df.to_csv(os.path.join(FIG_DIR, "per_case_metrics.csv"), index=False, float_format='%.6f')
+    df.to_csv(os.path.join(FIG_DIR, "per_case_metrics_cp.csv"), index=False)
 
-    # <--- 绘图代码保持不变，因为新指标是百分比，与原有误差指标量纲不同，不适合画在同一张图上 --->
+    # <--- 修改: 在误差图上增加平面rRMSE的曲线
     plt.figure(figsize=(12, 6))
     plt.plot(df["Case"], df["MAE"], '-o', label="MAE (°C) [Full 3D]")
     plt.plot(df["Case"], df["RMSE"], '-s', label="RMSE (°C) [Full 3D]")
     plt.plot(df["Case"], df["rRMSE"], '-^', label="rRMSE [Full 3D]")
     plt.plot(df["Case"], df[f"rRMSE_plane_Y={y_plane_rrmse_value:.2f}m"], '-x', color='purple',
              label=f"rRMSE [Plane Y={y_plane_rrmse_value:.2f}m]")
-    plt.xlabel("案例")
-    plt.ylabel("误差值")
-    plt.title("Tucker+MLP 逐案例误差指标 (全场 vs. 特定平面)")
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--')
+    plt.xlabel("Case");
+    plt.ylabel("Error Value")
+    plt.title("CP+MLP Per-case Error Metrics (Full 3D vs. Specific Plane)")
+    plt.legend();
+    plt.grid(True, which='both', linestyle='--');
     plt.tight_layout()
-    plt.savefig(os.path.join(FIG_DIR, "error_metrics_compare.png"), dpi=200)
+    plt.savefig(os.path.join(FIG_DIR, "error_metrics_compare_cp.png"), dpi=200)
     plt.close()
 
-    # --- 可视化部分代码不变 ---
+    # =================== Visualization (Y-slice) (代码未改变) ===================
     if os.path.exists(POD_ERROR_MAX_PATH):
         try:
             shared_error_max = float(np.load(POD_ERROR_MAX_PATH))
             if not np.isfinite(shared_error_max) or shared_error_max <= 0:
                 shared_error_max = None
             else:
-                print(f"[Info] 使用来自POD的统一误差色标vmax: {shared_error_max:.4f}")
+                print(f"[Info] Unified error colormap vmax from POD: {shared_error_max:.4f}")
         except Exception:
             shared_error_max = None
     else:
         shared_error_max = None
-    print("=== 绘制 Y-切片云图 (GT vs Pred; +Error) ===")
+    print("=== Plot Y-slice maps (GT vs Pred; +Error) ===")
     for k, case_idx in enumerate(idx_test):
         T_true_slice = gts[:, y_slice_index, :, k];
         T_pred_slice = preds[:, y_slice_index, :, k]
         err_slice = np.abs(T_true_slice - T_pred_slice)
-        vmax = shared_error_max if (shared_error_max is not None) else float(np.nanmax(err_slice))
+        vmax = shared_error_max if shared_error_max is not None else float(np.nanmax(err_slice))
         xs_plot, zs_plot, T_true_plot = upsample_if_needed(xs, zs, T_true_slice.T)
         _, _, T_pred_plot = upsample_if_needed(xs, zs, T_pred_slice.T)
         _, _, err_plot = upsample_if_needed(xs, zs, err_slice.T)
         Xg, Zg = np.meshgrid(xs_plot, zs_plot, indexing='ij')
         fig = plt.figure(figsize=(18, 5));
-        plt.suptitle(f"Y-切片重构 | 案例 {case_idx + 1}", fontsize=16)
+        plt.suptitle(f"Y-slice Reconstruction | Case {case_idx + 1} (CP)", fontsize=16)
         ax1 = fig.add_subplot(1, 3, 1);
         c1 = ax1.contourf(Xg, Zg, T_true_plot.T, levels=LEVELS, cmap='jet');
-        ax1.set_title("真实温度");
-        ax1.set_xlabel("X (m)");
-        ax1.set_ylabel("Z (m)");
-        ax1.set_aspect('equal', adjustable='box');
+        ax1.set_title("True");
         fig.colorbar(c1, ax=ax1)
         ax2 = fig.add_subplot(1, 3, 2);
         c2 = ax2.contourf(Xg, Zg, T_pred_plot.T, levels=LEVELS, cmap='jet', vmin=c1.get_clim()[0],
                           vmax=c1.get_clim()[1]);
-        ax2.set_title("重构温度");
-        ax2.set_xlabel("X (m)");
-        ax2.set_ylabel("Z (m)");
-        ax2.set_aspect('equal', adjustable='box');
+        ax2.set_title("Reconstructed (CP)");
         fig.colorbar(c2, ax=ax2)
         if SAVE_ERROR_MAP:
             ax3 = fig.add_subplot(1, 3, 3);
             c3 = ax3.contourf(Xg, Zg, err_plot.T, levels=LEVELS, cmap='YlOrRd', vmin=0, vmax=vmax);
-            ax3.set_title(f"绝对误差 (vmax={vmax:.2f})");
-            ax3.set_xlabel("X (m)");
-            ax3.set_ylabel("Z (m)");
-            ax3.set_aspect('equal', adjustable='box');
+            ax3.set_title(f"Absolute Error (vmax={vmax:.2f})");
             fig.colorbar(c3, ax=ax3)
+        for ax in fig.get_axes(): ax.set_xlabel("X (m)"); ax.set_ylabel("Z (m)"); ax.set_aspect('equal',
+                                                                                                adjustable='box')
         plt.tight_layout(rect=[0, 0, 1, 0.95])
-        out_path = os.path.join(FIG_DIR, f"yslice_case_{case_idx + 1}.png")
-        plt.savefig(out_path, dpi=200, bbox_inches='tight');
+        plt.savefig(os.path.join(FIG_DIR, f"yslice_case_{case_idx + 1}_cp.png"), dpi=200, bbox_inches='tight')
         plt.close(fig)
 
-    # =================== 摘要 ===================
-    def sv_info(S):
-        e = (S ** 2);
-        cum = np.cumsum(e) / np.sum(e);
-        k = min(50, len(S))
-        return cum[:k].tolist()
-
-    # <--- 修改: 将新指标添加到JSON摘要中 --->
+    # =================== Summary ===================
+    # <--- 修改: 将新指标添加到JSON摘要中
     summary = {
-        "model_type": "Tucker_HOSVD",
+        "model_type": "CP_PARAFAC",
         "decomposition_set": "TRAIN",
-        "ranks": {"rx": int(rx), "ry": int(ry), "rz": int(rz), "rn": int(rn)},
-        "energy_threshold_per_mode": float(ENERGY_THRESH),
+        "cp_rank_R": int(CP_RANK),
         "config": {"center_along_N": bool(CENTER_ALONG_N), "scale_inputs": bool(SCALE_INPUTS),
                    "scale_output_coeff": bool(SCALE_OUTPUT_COEFF)},
         "regressor": REGRESSOR,
@@ -622,11 +550,6 @@ def main():
                 "y_value": float(y_plane_rrmse_value),
                 "value": float(np.mean(rRMSE_plane_list))
             },
-            "points_percentage_below_threshold": {  # <--- 新增
-                "threshold": float(RELATIVE_ERROR_THRESHOLD),
-                "mean_percentage": float(np.mean(percentage_below_threshold_list)),
-                "each_case_percentage": [float(x) for x in percentage_below_threshold_list]
-            },
             "full3d_mae_each": [float(x) for x in mae_list],
             "full3d_rmse_each": [float(x) for x in rmse_list],
             "full3d_rRMSE_each": [float(x) for x in rRMSE_list],
@@ -635,14 +558,13 @@ def main():
         },
         "y_slice_visualization": {"y_value": float(ys[y_slice_index]), "unified_error_vmax_from_pod": float(
             shared_error_max) if shared_error_max is not None else None},
-        "cumulative_energy_curves": {"mode_x": sv_info(singvals["Sx"]), "mode_y": sv_info(singvals["Sy"]),
-                                     "mode_z": sv_info(singvals["Sz"]), "mode_n": sv_info(singvals["Sn"])},
+        "cp_component_weights_preview": [float(x) for x in (cp_component_energy_weights(lambdas, Ax, Ay, Az)).tolist()],
         "execution_time_seconds": time.time() - start_main_time
     }
-    with open(os.path.join(FIG_DIR, "metrics_summary.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(FIG_DIR, "metrics_summary_cp.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"\n完成。总执行时间: {time.time() - start_main_time:.2f}s。输出目录:", os.path.abspath(FIG_DIR))
+    print("\nDone. Outputs in:", os.path.abspath(FIG_DIR))
 
 
 if __name__ == "__main__":
@@ -652,9 +574,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"错误: {e}")
+        print(f"ERROR: {e}")
         import traceback
 
         traceback.print_exc()
         sys.exit(1)
-
